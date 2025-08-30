@@ -1,4 +1,5 @@
 import { httpAction } from "./_generated/server";
+import { httpRouter } from "convex/server";
 import { Id } from "./_generated/dataModel";
 import { api } from "./_generated/api";
 
@@ -50,23 +51,54 @@ const options = httpAction(async () => {
   });
 });
 
-// AI Response Generation
+// AI Response Generation (OpenRouter)
 async function generateAIResponse(params: {
   messages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>;
   temperature: number;
   model: string;
 }): Promise<string> {
-  // TODO: Replace with your actual AI provider integration
-  // This is a placeholder implementation
-  const { messages } = params;
+  const { messages, temperature, model } = params;
   const lastMessage = messages[messages.length - 1];
-  
-  if (lastMessage.role !== 'user') {
+  if (!lastMessage || lastMessage.role !== 'user') {
     throw new Error('Last message must be from user');
   }
 
-  // Simulate AI response
-  return `This is a simulated response to: "${lastMessage.content}"`;
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) {
+    // Safe fallback if no key is configured
+    return `AI (stub): ${lastMessage.content}`;
+  }
+
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        // Optional best practice headers for OpenRouter analytics
+        'HTTP-Referer': process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000',
+        'X-Title': 'Vaste Chatbot',
+      },
+      body: JSON.stringify({
+        model: model || 'openai/gpt-4o-mini',
+        temperature: typeof temperature === 'number' ? temperature : 0.7,
+        messages: messages.map(m => ({ role: m.role, content: m.content })),
+      }),
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`OpenRouter error ${res.status}: ${text}`);
+    }
+
+    const data = await res.json() as any;
+    const content: string | undefined = data?.choices?.[0]?.message?.content;
+    if (!content) throw new Error('No content in completion');
+    return content;
+  } catch (error) {
+    console.error('OpenRouter request failed:', error);
+    return 'Sorry, I had trouble generating a response.';
+  }
 }
 
 // Create a new widget session
@@ -78,14 +110,27 @@ export const createWidgetSession = httpAction(async (ctx, req) => {
 
   try {
     const body = await req.json();
-    const agentId = body?.agentId as Id<"agents">;
-    
-    if (!agentId) {
+    let rawAgentId = body?.agentId as string | undefined;
+    // Basic Convex Id format check: 32 lowercase alphanumerics
+    const isValidConvexId = (s: string) => /^[a-z0-9]{32}$/.test(s);
+
+    if (!rawAgentId || typeof rawAgentId !== 'string') {
       return corsResponse({ error: 'agentId is required' }, 400);
     }
 
-    // Fetch agent details from the database
-    const agent = await ctx.runQuery(api.agents.get, { id: agentId });
+    // If client accidentally sends a JSON-stringified string (wrapped in quotes), strip them
+    if (rawAgentId.startsWith('"') && rawAgentId.endsWith('"')) {
+      rawAgentId = rawAgentId.slice(1, -1);
+    }
+
+    if (!isValidConvexId(rawAgentId)) {
+      return corsResponse({ error: 'Invalid agentId format' }, 400);
+    }
+
+    const agentId = rawAgentId as unknown as Id<"agents">;
+    
+    // Fetch agent details from the database (public)
+    const agent = await ctx.runQuery(api.agents.getPublic, { id: agentId });
     
     if (!agent) {
       return corsResponse({ error: 'Agent not found' }, 404);
@@ -157,11 +202,27 @@ export const widgetChat = httpAction(async (ctx, req) => {
       return corsResponse({ error: 'Session does not belong to this agent' }, 403);
     }
 
-    // Get the agent
-    const agent = await ctx.runQuery(api.agents.get, { id: agentId });
+    // Get the agent (public)
+    const agent = await ctx.runQuery(api.agents.getPublic, { id: agentId });
     if (!agent) {
       return corsResponse({ error: 'Agent not found' }, 404);
     }
+
+    // Fetch agent knowledge base entries (public)
+    const knowledge = await ctx.runQuery(api.fineTuning.getPublicAgentKnowledge, {
+      agentId: agentId as unknown as string,
+      limit: 20,
+    });
+    const knowledgeText = (knowledge || [])
+      .map((k: { input: unknown; output: unknown }) => {
+        const input = typeof k.input === 'string' ? k.input : '';
+        const output = typeof k.output === 'string' ? k.output : '';
+        return `- ${input}: ${output}`;
+      })
+      .join('\n');
+    const knowledgeSection = knowledgeText
+      ? `\n\nKnowledge Base (most recent first):\n${knowledgeText}`
+      : '';
 
     // Add the user message to the database
     await ctx.runMutation(api.sessions.createMessage, {
@@ -173,7 +234,7 @@ export const widgetChat = httpAction(async (ctx, req) => {
 
     // Prepare messages for AI
     const messages = [
-      { role: 'system' as const, content: agent.systemPrompt },
+      { role: 'system' as const, content: `${agent.systemPrompt}${knowledgeSection}` },
       ...history,
       { role: 'user' as const, content: message }
     ];
@@ -212,19 +273,23 @@ export const widgetChat = httpAction(async (ctx, req) => {
   }
 });
 
-// Export the API routes
-export const http = {
-  '/api/chat/widget/session': {
-    POST: createWidgetSession,
-    OPTIONS: options,
-  },
-  '/api/chat/widget/chat': {
-    POST: widgetChat,
-    OPTIONS: options,
-  },
-  // Add a health check endpoint
-  '/health': {
-    GET: async () => corsResponse({ status: 'ok' }),
-    OPTIONS: options,
-  },
-} as const;
+// Build HTTP router
+const http = httpRouter();
+const health = httpAction(async () => corsResponse({ status: "ok" }));
+
+http.route({ path: "/api/chat/widget/session", method: "POST", handler: createWidgetSession });
+http.route({ path: "/api/chat/widget/session", method: "OPTIONS", handler: options });
+http.route({ path: "/chat/widget/session", method: "POST", handler: createWidgetSession });
+http.route({ path: "/chat/widget/session", method: "OPTIONS", handler: options });
+
+http.route({ path: "/api/chat/widget/chat", method: "POST", handler: widgetChat });
+http.route({ path: "/api/chat/widget/chat", method: "OPTIONS", handler: options });
+http.route({ path: "/chat/widget/chat", method: "POST", handler: widgetChat });
+http.route({ path: "/chat/widget/chat", method: "OPTIONS", handler: options });
+
+http.route({ path: "/api/health", method: "GET", handler: health });
+http.route({ path: "/api/health", method: "OPTIONS", handler: options });
+http.route({ path: "/health", method: "GET", handler: health });
+http.route({ path: "/health", method: "OPTIONS", handler: options });
+
+export default http;

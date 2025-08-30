@@ -175,9 +175,9 @@ export default function Dashboard() {
                     </div>
                     <div className="flex gap-1 mt-1">
                       <Button variant="outline" size="sm" className="flex-1 h-6 text-xs px-1" asChild>
-                        <Link href={`/agent/${agent._id}`} className="flex items-center justify-center">
+                        <Link href={`/agent/${agent._id}/history`} className="flex items-center justify-center">
                           <MessageSquare className="h-2.5 w-2.5 mr-0.5" />
-                          Chat
+                          History
                         </Link>
                       </Button>
                       <Button variant="outline" size="sm" className="flex-1 h-6 text-xs px-1" asChild>

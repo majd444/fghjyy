@@ -67,3 +67,50 @@ export const getSessionMessages = query({
       .collect();
   },
 });
+
+// Get simple stats for a session's messages
+export const getSessionMessageStats = query({
+  args: { sessionId: v.id("chatSessions") },
+  handler: async (ctx, args) => {
+    const msgs = await ctx.db
+      .query("chatMessages")
+      .withIndex("by_session", (q) => q.eq("sessionId", args.sessionId))
+      .order("desc")
+      .take(50); // take recent messages for quick count; UI use only
+    const count = msgs.length;
+    const last = msgs[0] || null;
+    return {
+      count,
+      lastContent: last?.content ?? null,
+      lastCreatedAt: last?.createdAt ?? null,
+    };
+  },
+});
+
+// List sessions for the current authenticated user for a given agent
+export const listByAgentForCurrentUser = query({
+  args: { agentId: v.id("agents") },
+  handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) {
+      return [];
+    }
+    const userId = identity.subject;
+    const agent = await ctx.db.get(args.agentId);
+    if (!agent) return [];
+
+    const sessions = await ctx.db
+      .query("chatSessions")
+      .withIndex("by_agent", (q) => q.eq("agentId", args.agentId))
+      .order("desc")
+      .collect();
+
+    // If the signed-in user owns the agent, return all sessions (including widget/guest sessions)
+    if (agent.userId === userId) {
+      return sessions;
+    }
+
+    // Otherwise, only return sessions that belong to this signed-in user
+    return sessions.filter((s) => s.userId === userId);
+  },
+});

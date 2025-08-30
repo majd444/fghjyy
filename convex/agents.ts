@@ -73,6 +73,15 @@ export const get = query({
   },
 });
 
+// Public read for widget by ID (no authentication, no ownership checks)
+export const getPublic = query({
+  args: { id: v.id("agents") },
+  handler: async (ctx, args) => {
+    const agent = await ctx.db.get(args.id)
+    return agent || null
+  }
+})
+
 export const update = mutation({
   args: {
     id: v.id("agents"),
@@ -260,6 +269,61 @@ export const create = mutation({
       
       // Re-throw with user-friendly message
       throw new Error(`Failed to create agent: ${errorMessage}`)
+    }
+  },
+})
+
+// Delete an agent the current user owns and cascade-delete related knowledge
+export const remove = mutation({
+  args: { id: v.id("agents") },
+  handler: async (ctx, args) => {
+    try {
+      console.log("[agents.remove] called with:", { id: String(args.id) });
+      const identity = await ctx.auth.getUserIdentity();
+      if (!identity) {
+        console.warn("[agents.remove] Not authenticated");
+        throw new ConvexError("Not authenticated");
+      }
+
+      const agent = await ctx.db.get(args.id);
+      if (!agent) {
+        console.warn("[agents.remove] Agent not found", { id: String(args.id) });
+        throw new ConvexError("Agent not found");
+      }
+      if (agent.userId !== identity.subject) {
+        console.warn("[agents.remove] Not authorized", { user: identity.subject, owner: agent.userId, id: String(args.id) });
+        throw new ConvexError("Not authorized to delete this agent");
+      }
+
+      // Cascade delete fine-tuning outputs for this agent owned by the same user
+      const agentIdStr = String(args.id);
+      console.log("[agents.remove] Querying outputs by index by_agent (all users)", { agentIdStr });
+      const outputs = await ctx.db
+        .query("fineTuningOutputs")
+        .withIndex("by_agent", (q) => q
+          .eq("agentId", agentIdStr)
+          .gte("userId", "")
+          .lte("userId", "\uffff")
+        )
+        .collect();
+      console.log("[agents.remove] Found outputs count:", outputs.length);
+
+      for (const out of outputs) {
+        try {
+          await ctx.db.delete(out._id);
+        } catch (e) {
+          console.error("[agents.remove] Failed deleting fineTuningOutput", { id: String(out._id), error: e });
+          throw new ConvexError("Failed to delete related knowledge record(s)");
+        }
+      }
+
+      await ctx.db.delete(args.id);
+      console.log("[agents.remove] Deleted agent", { id: String(args.id) });
+      return true;
+    } catch (err) {
+      console.error("[agents.remove] Error:", err);
+      if (err instanceof ConvexError) throw err;
+      throw new ConvexError("Failed to delete agent");
     }
   },
 })

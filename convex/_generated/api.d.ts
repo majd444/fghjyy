@@ -17,6 +17,7 @@ import type * as agents from "../agents.js";
 import type * as chat from "../chat.js";
 import type * as chatWidget from "../chatWidget.js";
 import type * as fineTuning from "../fineTuning.js";
+import type * as http from "../http.js";
 import type * as sessions from "../sessions.js";
 import type * as test from "../test.js";
 import type * as testQueries from "../testQueries.js";
@@ -35,6 +36,7 @@ declare const fullApi: ApiFromModules<{
   chat: typeof chat;
   chatWidget: typeof chatWidget;
   fineTuning: typeof fineTuning;
+  http: typeof http;
   sessions: typeof sessions;
   test: typeof test;
   testQueries: typeof testQueries;

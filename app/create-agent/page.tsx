@@ -6,6 +6,7 @@ import Image from "next/image"
 import { X, RefreshCw, Upload, FileText, Globe, Trash2, Copy, Plus, Edit2, ChevronDown, Phone, User, Mail, Puzzle } from "lucide-react"
 import { useMutation } from "convex/react"
 import { api } from "@/convex/_generated/api"
+import { Id } from "@/convex/_generated/dataModel"
 import { useUser } from "@clerk/nextjs"
 import { useToast } from "@/hooks/use-toast"
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover"
@@ -19,6 +20,7 @@ import ChatInterface from "@/components/chat-interface"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Card, CardContent } from "@/components/ui/card"
 import { Switch } from "@/components/ui/switch"
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog"
 
 // Interfaces
 interface CreateAgentModalProps {
@@ -56,6 +58,8 @@ const colorPalette = [
 function CreateAgentModal({ onClose }: CreateAgentModalProps) {
   const router = useRouter()
   const createAgent = useMutation(api.agents.create)
+  const updateAgent = useMutation(api.agents.update)
+  const saveFineTuning = useMutation(api.fineTuning.saveFineTuningOutput)
   const { user } = useUser()
   const { toast } = useToast()
 
@@ -87,6 +91,7 @@ function CreateAgentModal({ onClose }: CreateAgentModalProps) {
   const [position, setPosition] = useState({ x: 0, y: 0 })
   const [startPos, setStartPos] = useState({ x: 0, y: 0 })
   const [scale, setScale] = useState(1)
+  const [agentIdState, setAgentIdState] = useState<string | null>(null)
   const [formFields, setFormFields] = useState<Array<{
     id: string;
     type: string;
@@ -115,22 +120,65 @@ function CreateAgentModal({ onClose }: CreateAgentModalProps) {
     setError(null)
 
     try {
-      const response = await fetch('/api/extract-url', {
+      const response = await fetch('/api/extract', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: extractionUrl }),
       })
       const responseData = await response.json()
 
-      if (!response.ok) throw new Error(responseData.error || 'Failed to extract content from URL')
+      if (!response.ok || responseData?.success === false) {
+        const msg = responseData?.error || `${response.status} ${response.statusText}`
+        throw new Error(msg || 'Failed to extract content from URL')
+      }
       if (!responseData.text && (!responseData.structured || responseData.structured.links.length === 0)) {
         throw new Error('No extractable content found on the page')
       }
 
+      // Prepare preview and capped content for saving
+      const MAX_SAVE_CHARS = 200_000
+      const textToSave = (responseData.text || '').slice(0, MAX_SAVE_CHARS)
+
       const newContent: ExtractedContent = {
         url: extractionUrl,
-        text: responseData.text,
+        text: textToSave,
         structured: responseData.structured || { tabs: [], inputs: [], buttons: [], links: [] },
+      }
+
+      // Save to knowledge base only if authenticated; ensure agent exists
+      if (user) {
+        try {
+          const agentId = await ensureAgentSaved()
+          const insertedId = await saveFineTuning({
+            agentId: String(agentId),
+            input: `url:${extractionUrl}`,
+            output: textToSave,
+            metadata: {
+              structured: responseData.structured,
+              source: 'edge-extract',
+              lengthOriginal: (responseData.text || '').length,
+            },
+          })
+          console.log('[create-agent] Saved fine-tuning entry:', String(insertedId))
+          toast({
+            className: 'bg-green-500 text-white',
+            title: 'Saved to Knowledge Base',
+            description: `Saved ${textToSave.length} chars from ${extractionUrl}`,
+          })
+        } catch (e) {
+          console.error('[create-agent] Save to knowledge base failed:', e)
+          toast({
+            className: 'bg-yellow-500 text-white',
+            title: 'Preview only',
+            description: 'Could not save to Knowledge Base. Content still available below.',
+          })
+        }
+      } else {
+        toast({
+          className: 'bg-blue-500 text-white',
+          title: 'Preview Ready',
+          description: 'Sign in to save extracted content to your Knowledge Base.',
+        })
       }
 
       setExtractedContents(prev => [...prev, newContent])
@@ -282,7 +330,7 @@ function CreateAgentModal({ onClose }: CreateAgentModalProps) {
         value: field.value || ''
       }));
 
-      console.log("[handleSave] Calling createAgent mutation with data:", {
+      console.log("[handleSave] Preparing agent payload:", {
         name: assistantName,
         welcomeMessage: welcomeMessage || `👋 Hi there! I'm ${assistantName}. How can I help you today?`,
         systemPrompt: systemPrompt || "You are a helpful AI assistant.",
@@ -295,21 +343,41 @@ function CreateAgentModal({ onClose }: CreateAgentModalProps) {
         formFields: formFieldsData
       });
 
-      // Call the mutation
-      const agentId = await createAgent({
-        name: assistantName,
-        welcomeMessage: welcomeMessage || `👋 Hi there! I'm ${assistantName}. How can I help you today?`,
-        systemPrompt: systemPrompt || "You are a helpful AI assistant.",
-        temperature,
-        headerColor,
-        accentColor,
-        backgroundColor,
-        profileImage: profileImage || undefined,
-        collectUserInfo,
-        formFields: formFieldsData
-      });
-
-      console.log("[handleSave] Agent created successfully with ID:", agentId);
+      // If we already created an agent (e.g., during extraction), update it; otherwise create
+      let finalAgentId: string;
+      if (agentIdState) {
+        await updateAgent({
+          id: agentIdState as Id<"agents">,
+          name: assistantName,
+          welcomeMessage: welcomeMessage || `👋 Hi there! I'm ${assistantName}. How can I help you today?`,
+          systemPrompt: systemPrompt || "You are a helpful AI assistant.",
+          temperature,
+          headerColor,
+          accentColor,
+          backgroundColor,
+          profileImage: profileImage || undefined,
+          collectUserInfo,
+          formFields: formFieldsData
+        });
+        finalAgentId = agentIdState;
+        console.log("[handleSave] Agent updated successfully:", finalAgentId);
+      } else {
+        const createdId = await createAgent({
+          name: assistantName,
+          welcomeMessage: welcomeMessage || `👋 Hi there! I'm ${assistantName}. How can I help you today?`,
+          systemPrompt: systemPrompt || "You are a helpful AI assistant.",
+          temperature,
+          headerColor,
+          accentColor,
+          backgroundColor,
+          profileImage: profileImage || undefined,
+          collectUserInfo,
+          formFields: formFieldsData
+        });
+        finalAgentId = String(createdId);
+        setAgentIdState(finalAgentId);
+        console.log("[handleSave] Agent created successfully with ID:", finalAgentId);
+      }
       
       // Show success message
       toast({
@@ -318,8 +386,8 @@ function CreateAgentModal({ onClose }: CreateAgentModalProps) {
         description: "Agent created successfully",
       });
 
-      // Redirect to the new agent's page
-      router.push(`/agent/${agentId}`);
+      // Redirect to the agent's page (updated or created)
+      router.push(`/agent/${finalAgentId}`);
       
     } catch (error) {
       console.error("[handleSave] Error creating agent:", error);
@@ -353,6 +421,52 @@ function CreateAgentModal({ onClose }: CreateAgentModalProps) {
       </div>
     );
   };
+
+  // Ensure an agent exists and return its ID (no redirect). Used by Plugins tab when clicking HTML & CSS card.
+  const ensureAgentSaved = async (): Promise<string> => {
+    if (agentIdState) return agentIdState;
+
+    if (!user) {
+      toast({
+        className: "bg-destructive text-destructive-foreground",
+        title: "Authentication Error",
+        description: "You must be logged in to save an agent",
+      });
+      throw new Error("Not authenticated");
+    }
+    if (!assistantName?.trim()) {
+      toast({
+        className: "bg-destructive text-destructive-foreground",
+        title: "Validation Error",
+        description: "Please provide a name for your agent",
+      });
+      throw new Error("Missing agent name");
+    }
+
+    const formFieldsData = formFields.map(field => ({
+      id: field.id,
+      type: field.type,
+      label: field.label,
+      required: field.required,
+      value: field.value || ''
+    }));
+
+    const newId = await createAgent({
+      name: assistantName,
+      welcomeMessage: welcomeMessage || `👋 Hi there! I'm ${assistantName}. How can I help you today?`,
+      systemPrompt: systemPrompt || "You are a helpful AI assistant.",
+      temperature,
+      headerColor,
+      accentColor,
+      backgroundColor,
+      profileImage: profileImage || undefined,
+      collectUserInfo,
+      formFields: formFieldsData
+    });
+    setAgentIdState(String(newId));
+    toast({ className: "bg-green-500 text-white", title: "Saved", description: "Agent saved for embedding." });
+    return String(newId);
+  }
 
   return (
     <div className="fixed inset-0 z-50 bg-white flex flex-col h-screen w-screen">
@@ -432,7 +546,7 @@ function CreateAgentModal({ onClose }: CreateAgentModalProps) {
               setScale={setScale}
               colorPalette={colorPalette}
             />
-            <PluginsTab plugins={pluginLogos} />
+            <PluginsTab plugins={pluginLogos} getAgentId={ensureAgentSaved} />
           </Tabs>
           {showError && (
             <Alert variant="destructive" className="mt-6 bg-amber-50 border-amber-200 text-amber-800">
@@ -1326,6 +1440,7 @@ const AvatarPreview: React.FC<AvatarPreviewProps> = ({
                   src={profileImage} 
                   alt="Profile preview"
                   fill
+                  sizes="100vw"
                   className="object-cover object-center block"
                   draggable={false}
                   onError={(e: React.SyntheticEvent<HTMLImageElement, Event>) => {
@@ -1461,26 +1576,69 @@ const ColorPicker: React.FC<ColorPickerProps> = ({
 
 interface PluginsTabProps {
   plugins: typeof pluginLogos
+  getAgentId: () => Promise<string>
 }
 
-const PluginsTab: React.FC<PluginsTabProps> = ({ plugins }) => (
-  <TabsContent value="plugins" className="space-y-6">
-    <div className="p-4 bg-gray-50 rounded-lg mb-4">
-      <h3 className="text-lg font-medium text-black">Available Plugins</h3>
-      <p className="text-sm text-black">Connect your chatbot with popular platforms and services to extend its functionality.</p>
-    </div>
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-      {plugins.map((plugin) => (
-        <Card key={plugin.id}>
-          <CardContent className="p-4">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center">
+const PluginsTab: React.FC<PluginsTabProps> = ({ plugins, getAgentId }) => {
+  const router = useRouter();
+  const [showEmbed, setShowEmbed] = React.useState(false)
+  const [snippet, setSnippet] = React.useState('<script src="/widget.js" data-bot-id="USER_BOT_ID"></script>')
+  const [isEmbedLoading, setIsEmbedLoading] = React.useState(false)
+  const [embedError, setEmbedError] = React.useState<string | null>(null)
+
+  const handleClick = async (pluginId: string) => {
+    if (pluginId === "wordpress") {
+      router.push('/integrations/wordpress');
+      return;
+    }
+    if (pluginId === "html-css") {
+      setEmbedError(null)
+      setShowEmbed(true)
+      setIsEmbedLoading(true)
+      try {
+        const id = await getAgentId()
+        const origin = typeof window !== 'undefined' ? window.location.origin : ''
+        setSnippet(`<script src="${origin}/widget.js" data-bot-id="${id}"></script>`)
+      } catch (err) {
+        console.error('Failed to get agent id for embed', err)
+        setEmbedError('Could not save agent. Please fix required fields or sign in, then try again.')
+      } finally {
+        setIsEmbedLoading(false)
+      }
+    }
+  }
+
+  const copySnippet = async () => {
+    try {
+      await navigator.clipboard.writeText(snippet)
+    } catch (e) {
+      console.error('Failed to copy snippet', e)
+    }
+  }
+
+  return (
+    <TabsContent value="plugins" className="space-y-6">
+      <div className="p-4 bg-gray-50 rounded-lg mb-4">
+        <h3 className="text-lg font-medium text-black">Available Plugins</h3>
+        <p className="text-sm text-black">Connect your chatbot with popular platforms and services to extend its functionality.</p>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {plugins.map((plugin) => (
+          <Card 
+            key={plugin.id}
+            onClick={() => handleClick(plugin.id)}
+            className={(plugin.id === 'html-css' || plugin.id === 'wordpress') ? 'cursor-pointer' : undefined}
+          >
+            <CardContent className="p-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center">
                 <div className="h-10 w-10 rounded bg-white border flex items-center justify-center mr-3 p-1">
                   <div className="relative h-10 w-10">
                     <Image
                       src={plugin.logoUrl || "/placeholder.svg"}
                       alt={`${plugin.name} logo`}
                       fill
+                      sizes="40px"
                       className="object-contain"
                       onError={(e: React.SyntheticEvent<HTMLImageElement, Event>) => {
                         const target = e.target as HTMLImageElement;
@@ -1511,24 +1669,48 @@ const PluginsTab: React.FC<PluginsTabProps> = ({ plugins }) => (
                   </p>
                 </div>
               </div>
-              <Switch />
-            </div>
-          </CardContent>
-        </Card>
-      ))}
-    </div>
-    <div className="mt-6">
-      <h3 className="text-lg font-medium mb-4 text-black">Plugin Configuration</h3>
-      <div className="bg-gray-50 p-4 rounded-lg">
-        <p className="text-sm text-black mb-3">Enable plugins above to configure their settings. Each plugin will require specific API keys or authentication tokens.</p>
-        <Button variant="outline" className="text-black">
-          <Puzzle className="mr-2 h-4 w-4" />
-          View Plugin Documentation
-        </Button>
+              </div>
+            </CardContent>
+          </Card>
+        ))}
       </div>
-    </div>
-  </TabsContent>
-)
+      <div className="mt-6">
+        <h3 className="text-lg font-medium mb-4 text-black">Plugin Configuration</h3>
+        <div className="bg-gray-50 p-4 rounded-lg">
+          <p className="text-sm text-black mb-3">Enable plugins above to configure their settings. Each plugin will require specific API keys or authentication tokens.</p>
+          <Button variant="outline" className="text-black">
+            <Puzzle className="mr-2 h-4 w-4" />
+            View Plugin Documentation
+          </Button>
+        </div>
+      </div>
+
+      <Dialog open={showEmbed} onOpenChange={(open) => { setShowEmbed(open); if (!open) { setEmbedError(null); } }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Embed Script</DialogTitle>
+            <DialogDescription>Copy and paste this into your website&apos;s HTML.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            {isEmbedLoading ? (
+              <div className="flex items-center gap-2 text-sm text-black"><RefreshCw className="h-4 w-4 animate-spin" /> Preparing your embed...</div>
+            ) : embedError ? (
+              <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded p-3">{embedError}</div>
+            ) : (
+              <pre className="bg-gray-100 text-black p-3 rounded overflow-auto text-sm">
+                <code>{snippet}</code>
+              </pre>
+            )}
+            <div className="flex gap-2 justify-end">
+              <Button onClick={copySnippet} variant="secondary" disabled={!!embedError || isEmbedLoading}>Copy</Button>
+              <Button onClick={() => setShowEmbed(false)}>Close</Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </TabsContent>
+  )
+}
 
 // Page Component
 const CreateAgentPage = () => {
